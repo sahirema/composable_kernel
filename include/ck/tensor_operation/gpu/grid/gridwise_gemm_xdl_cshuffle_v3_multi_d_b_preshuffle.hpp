@@ -346,6 +346,15 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3_b_preshuffle
         return math::integer_divide_ceil(K, KLane * KPackPerGroup);
     }
 
+    // Logical K0 length, rounded up to a per-block multiple (KRepeat = KPerBlock / KLane /
+    // KPackPerGroup). When GemmSpec is K-padding flavored, the B-side preshuffled descriptor
+    // right-pads K0 to this value so that out-of-range tail reads are zeroed by CK's
+    // bounds-checked tensor descriptor.
+    __host__ __device__ static auto CalculateBK0ShuffledPadded(index_t K)
+    {
+        return math::integer_divide_ceil(K, KPerBlock) * KRepeat;
+    }
+
     __host__ __device__ static auto CalculateKPadded(index_t K)
     {
         return math::integer_divide_ceil(K, KPerBlock) * KPerBlock;
@@ -483,14 +492,41 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3_b_preshuffle
         }
     }
 
-    __host__ __device__ static auto MakeBGridDescriptor_Preshuffled(index_t N0, index_t K0)
+    __host__ __device__ static auto
+    MakeBGridDescriptor_Preshuffled(index_t N0, index_t K0, index_t K0Pad)
     {
         constexpr index_t MWave           = MPerBlock / (MXdlPerWave * MPerXdl);
         constexpr index_t WaveSize        = BlockSize / (MWave * NWave);
         constexpr index_t NkSwizzleNumber = Number<WaveSize * KPackPerGroup>{};
-        return make_naive_tensor_descriptor(
+
+        const auto b_grid_desc_naive = make_naive_tensor_descriptor(
             make_tuple(N0 / NWave, NWave, K0, NkSwizzleNumber),
             make_tuple(NWave * K0 * NkSwizzleNumber, K0 * NkSwizzleNumber, NkSwizzleNumber, I1));
+
+        using GemmSpecialization = tensor_operation::device::GemmSpecialization;
+
+        // When GemmSpec includes K padding, right-pad the K0 dimension up to K0Pad so the inner
+        // GEMM loop iterates the full ceil(K/KPerBlock) blocks; CK's tensor-descriptor bounds
+        // check returns zero for K0 indices >= K0 (the OOB tail), without touching memory.
+        if constexpr(GemmSpec == GemmSpecialization::KPadding ||
+                     GemmSpec == GemmSpecialization::MKPadding ||
+                     GemmSpec == GemmSpecialization::NKPadding ||
+                     GemmSpec == GemmSpecialization::MNKPadding)
+        {
+            return transform_tensor_descriptor(
+                b_grid_desc_naive,
+                make_tuple(make_pass_through_transform(N0 / NWave),
+                           make_pass_through_transform(NWave),
+                           make_right_pad_transform(K0, K0Pad - K0),
+                           make_pass_through_transform(NkSwizzleNumber)),
+                make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}, Sequence<3>{}),
+                make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}, Sequence<3>{}));
+        }
+        else
+        {
+            ignore = K0Pad;
+            return b_grid_desc_naive;
+        }
     }
 
     __host__ __device__ static auto MakeBGridDescriptor_BK0_N_BK1(
@@ -1115,15 +1151,16 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3_b_preshuffle
                                const index_t k_id,
                                const index_t Kt)
     {
-        ignore              = b_element_op;
-        index_t BN0Shuffled = CalculateBN0Shuffled(problem.N);
-        index_t BK0Shuffled = CalculateBK0Shuffled(Kt);
+        ignore                    = b_element_op;
+        index_t BN0Shuffled       = CalculateBN0Shuffled(problem.N);
+        index_t BK0Shuffled       = CalculateBK0Shuffled(Kt);
+        index_t BK0ShuffledPadded = CalculateBK0ShuffledPadded(Kt);
 
         const auto a_grid_desc_ak0_m_ak1 = MakeAGridDescriptor_AK0_M_AK1(
             problem.M, problem.MPadded, problem.K, problem.KPadded, problem.StrideA, problem.AK0);
 
         const auto b_grid_desc_bpreshuffled =
-            MakeBGridDescriptor_Preshuffled(BN0Shuffled, BK0Shuffled);
+            MakeBGridDescriptor_Preshuffled(BN0Shuffled, BK0Shuffled, BK0ShuffledPadded);
         const auto c_grid_desc_m_n = MakeCGridDescriptor_M_N<CLayout>(
             problem.M, problem.MPadded, problem.N, problem.NPadded, problem.StrideC);
 
@@ -1321,11 +1358,12 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3_b_preshuffle
         ignore                           = b_element_op;
         index_t BN0Shuffled              = CalculateBN0Shuffled(problem.N);
         index_t BK0Shuffled              = CalculateBK0Shuffled(Kt);
+        index_t BK0ShuffledPadded        = CalculateBK0ShuffledPadded(Kt);
         const auto a_grid_desc_ak0_m_ak1 = MakeAGridDescriptor_AK0_M_AK1(
             problem.M, problem.MPadded, problem.K, problem.KPadded, problem.StrideA, problem.AK0);
 
         const auto b_grid_desc_bpreshuffled =
-            MakeBGridDescriptor_Preshuffled(BN0Shuffled, BK0Shuffled);
+            MakeBGridDescriptor_Preshuffled(BN0Shuffled, BK0Shuffled, BK0ShuffledPadded);
         const auto c_grid_desc_m_n = MakeCGridDescriptor_M_N<CLayout>(
             problem.M, problem.MPadded, problem.N, problem.NPadded, problem.StrideC);
 

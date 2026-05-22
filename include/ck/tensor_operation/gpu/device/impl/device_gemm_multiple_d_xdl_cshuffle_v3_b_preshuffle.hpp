@@ -543,7 +543,19 @@ struct DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle
             return false;
         }
 
-        if(arg.N % NPerBlock != 0 || arg.K % KPerBlock != 0)
+        if(arg.N % NPerBlock != 0)
+        {
+            return false;
+        }
+
+        // K not divisible by KPerBlock is supported when GemmSpec is K-padding flavored.
+        // The gridwise B-side preshuffled descriptor right-pads K0 up to KPerBlock so the
+        // tail iteration reads zero through CK's bounds-checked tensor descriptor; A-side
+        // already pads via make_right_pad_transform in MakeAGridDescriptor_AK0_M_AK1.
+        if(arg.K % KPerBlock != 0 && !(GemmSpec == GemmSpecialization::MKPadding ||
+                                       GemmSpec == GemmSpecialization::NKPadding ||
+                                       GemmSpec == GemmSpecialization::MNKPadding ||
+                                       GemmSpec == GemmSpecialization::KPadding))
         {
             return false;
         }
