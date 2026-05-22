@@ -568,7 +568,15 @@ struct DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle
             return false;
         }
 
-        if(arg.N % NPerBlock != 0)
+        // N not divisible by NPerBlock is supported when GemmSpec is N-padding flavored.
+        // The gridwise B-side preshuffled descriptor right-pads N0 (= ceil(N/NLane)) up to
+        // a per-block multiple so the trailing N tile reads zero through CK's bounds-checked
+        // tensor descriptor; C-side already pads via make_right_pad_transform in
+        // MakeCGridDescriptor_M_N so OOB writes are dropped.
+        if(arg.N % NPerBlock != 0 && !(GemmSpec == GemmSpecialization::NPadding ||
+                                       GemmSpec == GemmSpecialization::MNPadding ||
+                                       GemmSpec == GemmSpecialization::NKPadding ||
+                                       GemmSpec == GemmSpecialization::MNKPadding))
         {
             return false;
         }

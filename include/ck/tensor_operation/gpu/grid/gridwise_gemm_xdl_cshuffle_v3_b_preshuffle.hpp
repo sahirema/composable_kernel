@@ -337,6 +337,17 @@ struct GridwiseGemm_xdl_cshuffle_v3_b_preshuffle
         return math::integer_divide_ceil(K, KLane * KPackPerGroup);
     }
 
+    // Logical N0 length (= ceil(N/NLane)) rounded up to a per-block multiple
+    // (NWave * NXdlPerWave == NPerBlock / NLane). When GemmSpec is N-padding flavored, the
+    // B-side preshuffled descriptor right-pads N0 to this value so the trailing partial
+    // N-tile reads zero through CK's bounds-checked tensor descriptor; C-side already pads
+    // N to NPadded via MakeCGridDescriptor_M_N so OOB writes are dropped.
+    __host__ __device__ static auto CalculateBN0ShuffledPadded(index_t N)
+    {
+        constexpr index_t BN0PerBlock = NWave * NXdlPerWave;
+        return math::integer_divide_ceil(N, NPerBlock) * BN0PerBlock;
+    }
+
     // Logical K0 length, rounded up to a per-block multiple (KRepeat = KPerBlock / KLane /
     // KPack). When GemmSpec is K-padding flavored, the B-side preshuffled descriptor right-pads
     // K0 to this value so that out-of-range tail reads are zeroed by CK's bounds-checked
@@ -483,40 +494,103 @@ struct GridwiseGemm_xdl_cshuffle_v3_b_preshuffle
         }
     }
 
-    __host__ __device__ static auto
-    MakeBGridDescriptor_Preshuffled(index_t N0, index_t K0, index_t K0Pad)
+    __host__ __device__ static auto MakeBGridDescriptor_Preshuffled(
+        index_t N0, index_t N0Pad, index_t K0, index_t K0Pad)
     {
         constexpr index_t MWave           = MPerBlock / (MXdlPerWave * MPerXdl);
         constexpr index_t WaveSize        = BlockSize / (MWave * NWave);
         constexpr index_t NkSwizzleNumber = Number<WaveSize * KPackPerGroup>{};
 
-        const auto b_grid_desc_naive = make_naive_tensor_descriptor(
-            make_tuple(N0 / NWave, NWave, K0, NkSwizzleNumber),
-            make_tuple(NWave * K0 * NkSwizzleNumber, K0 * NkSwizzleNumber, NkSwizzleNumber, I1));
-
         using GemmSpecialization = tensor_operation::device::GemmSpecialization;
 
-        // When GemmSpec includes K padding, right-pad the K0 dimension up to K0Pad so the inner
-        // GEMM loop iterates the full ceil(K/KPerBlock) blocks; CK's tensor-descriptor bounds
-        // check returns zero for K0 indices >= K0 (the OOB tail), without touching memory.
-        if constexpr(GemmSpec == GemmSpecialization::KPadding ||
-                     GemmSpec == GemmSpecialization::MKPadding ||
-                     GemmSpec == GemmSpecialization::NKPadding ||
-                     GemmSpec == GemmSpecialization::MNKPadding)
+        constexpr bool n_pad = GemmSpec == GemmSpecialization::NPadding ||
+                               GemmSpec == GemmSpecialization::MNPadding ||
+                               GemmSpec == GemmSpecialization::NKPadding ||
+                               GemmSpec == GemmSpecialization::MNKPadding;
+        constexpr bool k_pad = GemmSpec == GemmSpecialization::KPadding ||
+                               GemmSpec == GemmSpecialization::MKPadding ||
+                               GemmSpec == GemmSpecialization::NKPadding ||
+                               GemmSpec == GemmSpecialization::MNKPadding;
+
+        if constexpr(n_pad)
         {
-            return transform_tensor_descriptor(
-                b_grid_desc_naive,
-                make_tuple(make_pass_through_transform(N0 / NWave),
-                           make_pass_through_transform(NWave),
-                           make_right_pad_transform(K0, K0Pad - K0),
-                           make_pass_through_transform(NkSwizzleNumber)),
-                make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}, Sequence<3>{}),
-                make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}, Sequence<3>{}));
+            // N-padding path: flat (N0, K0, NkSwizzleNumber) descriptor over the physical
+            // preshuffled buffer (which holds exactly N0 * K0 * NkSwizzleNumber elements --
+            // AIter's shuffle_weight does NOT physically pad N), right-pad N0 up to N0Pad
+            // (and optionally K0 up to K0Pad), then unmerge N0Pad into the
+            // (N0Pad/NWave, NWave) layout the blockwise pipe expects. N0Pad is guaranteed
+            // to be a multiple of NWave by CalculateBN0ShuffledPadded
+            // (ceil(N/NPerBlock) * NWave * NXdlPerWave).
+            const auto b_grid_desc_flat = make_naive_tensor_descriptor(
+                make_tuple(N0, K0, NkSwizzleNumber),
+                make_tuple(K0 * NkSwizzleNumber, NkSwizzleNumber, I1));
+
+            if constexpr(k_pad)
+            {
+                const auto b_grid_desc_npad_kpad_nk = transform_tensor_descriptor(
+                    b_grid_desc_flat,
+                    make_tuple(make_right_pad_transform(N0, N0Pad - N0),
+                               make_right_pad_transform(K0, K0Pad - K0),
+                               make_pass_through_transform(NkSwizzleNumber)),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}));
+
+                return transform_tensor_descriptor(
+                    b_grid_desc_npad_kpad_nk,
+                    make_tuple(
+                        make_unmerge_transform(make_tuple(N0Pad / NWave, Number<NWave>{})),
+                        make_pass_through_transform(K0Pad),
+                        make_pass_through_transform(NkSwizzleNumber)),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}),
+                    make_tuple(Sequence<0, 1>{}, Sequence<2>{}, Sequence<3>{}));
+            }
+            else
+            {
+                ignore = K0Pad;
+
+                const auto b_grid_desc_npad_k0_nk = transform_tensor_descriptor(
+                    b_grid_desc_flat,
+                    make_tuple(make_right_pad_transform(N0, N0Pad - N0),
+                               make_pass_through_transform(K0),
+                               make_pass_through_transform(NkSwizzleNumber)),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}));
+
+                return transform_tensor_descriptor(
+                    b_grid_desc_npad_k0_nk,
+                    make_tuple(
+                        make_unmerge_transform(make_tuple(N0Pad / NWave, Number<NWave>{})),
+                        make_pass_through_transform(K0),
+                        make_pass_through_transform(NkSwizzleNumber)),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}),
+                    make_tuple(Sequence<0, 1>{}, Sequence<2>{}, Sequence<3>{}));
+            }
         }
         else
         {
-            ignore = K0Pad;
-            return b_grid_desc_naive;
+            ignore = N0Pad;
+
+            const auto b_grid_desc_naive = make_naive_tensor_descriptor(
+                make_tuple(N0 / NWave, NWave, K0, NkSwizzleNumber),
+                make_tuple(NWave * K0 * NkSwizzleNumber, K0 * NkSwizzleNumber, NkSwizzleNumber, I1));
+
+            // K-only padding path (unchanged from the K-padding patch).
+            if constexpr(k_pad)
+            {
+                return transform_tensor_descriptor(
+                    b_grid_desc_naive,
+                    make_tuple(make_pass_through_transform(N0 / NWave),
+                               make_pass_through_transform(NWave),
+                               make_right_pad_transform(K0, K0Pad - K0),
+                               make_pass_through_transform(NkSwizzleNumber)),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}, Sequence<3>{}),
+                    make_tuple(Sequence<0>{}, Sequence<1>{}, Sequence<2>{}, Sequence<3>{}));
+            }
+            else
+            {
+                ignore = K0Pad;
+                return b_grid_desc_naive;
+            }
         }
     }
 
@@ -1279,12 +1353,13 @@ struct GridwiseGemm_xdl_cshuffle_v3_b_preshuffle
                                const index_t Kt)
     {
         index_t BN0Shuffled              = CalculateBN0Shuffled(problem.N);
+        index_t BN0ShuffledPadded        = CalculateBN0ShuffledPadded(problem.N);
         index_t BK0Shuffled              = CalculateBK0Shuffled(Kt);
         index_t BK0ShuffledPadded        = CalculateBK0ShuffledPadded(Kt);
         const auto a_grid_desc_ak0_m_ak1 = MakeAGridDescriptor_AK0_M_AK1(
             problem.M, problem.MPadded, problem.K, problem.KPadded, problem.StrideA, problem.AK0);
-        const auto b_grid_desc_bpreshuffled =
-            MakeBGridDescriptor_Preshuffled(BN0Shuffled, BK0Shuffled, BK0ShuffledPadded);
+        const auto b_grid_desc_bpreshuffled = MakeBGridDescriptor_Preshuffled(
+            BN0Shuffled, BN0ShuffledPadded, BK0Shuffled, BK0ShuffledPadded);
         const auto c_grid_desc_m_n = MakeCGridDescriptor_M_N(
             problem.M, problem.MPadded, problem.N, problem.NPadded, problem.StrideC);
         const auto c_grid_desc_mblock_mperblock_nblock_nperblock =
@@ -1482,12 +1557,13 @@ struct GridwiseGemm_xdl_cshuffle_v3_b_preshuffle
                                     const index_t Kt)
     {
         index_t BN0Shuffled              = CalculateBN0Shuffled(problem.N);
+        index_t BN0ShuffledPadded        = CalculateBN0ShuffledPadded(problem.N);
         index_t BK0Shuffled              = CalculateBK0Shuffled(Kt);
         index_t BK0ShuffledPadded        = CalculateBK0ShuffledPadded(Kt);
         const auto a_grid_desc_ak0_m_ak1 = MakeAGridDescriptor_AK0_M_AK1(
             problem.M, problem.MPadded, problem.K, problem.KPadded, problem.StrideA, problem.AK0);
-        const auto b_grid_desc_bpreshuffled =
-            MakeBGridDescriptor_Preshuffled(BN0Shuffled, BK0Shuffled, BK0ShuffledPadded);
+        const auto b_grid_desc_bpreshuffled = MakeBGridDescriptor_Preshuffled(
+            BN0Shuffled, BN0ShuffledPadded, BK0Shuffled, BK0ShuffledPadded);
         const auto c_grid_desc_m_n = MakeCGridDescriptor_M_N(
             problem.M, problem.MPadded, problem.N, problem.NPadded, problem.StrideC);
 
