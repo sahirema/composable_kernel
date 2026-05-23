@@ -453,7 +453,29 @@ struct DeviceMoeGemm : public DeviceGemmMultipleDSplitKBPreShuffle<ALayout,
         {
             return false;
         }
-        if(arg.N % NPerBlock != 0 || arg.K % KPerBlock != 0)
+        // [glm4v-fp8-padding-ck-moe] Relax the strict per-block-tile alignment
+        // check to respect ``GemmSpec``, mirroring the pattern of the AK1/BK1
+        // check above and matching ``GridwiseMoeGemm::CheckValidity``'s
+        // padding-spec-aware branches. The pre-patch version rejected any
+        // ``arg.N % NPerBlock != 0`` or ``arg.K % KPerBlock != 0`` regardless
+        // of whether the caller selected a padding ``GemmSpec`` -- which made
+        // the gridwise K-pad path effectively unreachable. With this relax,
+        // callers that opt into ``KPadding`` (or any of the N/K padding
+        // variants) get the K-pad descriptor branch the gridwise already
+        // implements in ``MakeAGridDescriptor_AK0_M_AK1`` and
+        // ``MakeBGridDescriptor_BK0_N_BK1``. Behaviour for ``GemmSpec ==
+        // Default`` is unchanged.
+        if(arg.N % NPerBlock != 0 && !(GemmSpec == GemmSpecialization::NPadding ||
+                                       GemmSpec == GemmSpecialization::MNPadding ||
+                                       GemmSpec == GemmSpecialization::NKPadding ||
+                                       GemmSpec == GemmSpecialization::MNKPadding))
+        {
+            return false;
+        }
+        if(arg.K % KPerBlock != 0 && !(GemmSpec == GemmSpecialization::KPadding ||
+                                       GemmSpec == GemmSpecialization::MKPadding ||
+                                       GemmSpec == GemmSpecialization::NKPadding ||
+                                       GemmSpec == GemmSpecialization::MNKPadding))
         {
             return false;
         }
