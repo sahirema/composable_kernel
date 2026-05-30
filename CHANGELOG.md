@@ -5,6 +5,7 @@ Documentation for Composable Kernel available at [https://rocm.docs.amd.com/proj
 ## (Unreleased) Composable Kernel 1.3.0
 
 ### Added
+* Added GemmSpec-aware N/K padding support to the weight-preshuffle XDL GEMM (`DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle`) and MoE GEMM (`DeviceMoeGemm`), allowing `N`/`K` that are not multiples of `NPerBlock`/`KPerBlock` when a padding `GemmSpecialization` is selected.
 * Added overload of load_tile_transpose that takes reference to output tensor as output parameter
 * Use data type from LDS tensor view when determining tile distribution for transpose in the GEMM pipeline
 * Added eightwarps support for abquant mode in blockscale GEMM.

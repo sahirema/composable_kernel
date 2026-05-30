@@ -75,3 +75,41 @@ TYPED_TEST(TestGemmMultiplyMultiplyWP_FP8_MK_NK, Regular2)
     for(int M : Ms)
         this->Run(M, N, K);
 }
+
+// The following cases cover the GemmSpec-aware N/K padding paths in
+// DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle. They use problem sizes whose N (resp. K) is
+// not a multiple of any instance's NPerBlock (resp. KPerBlock), so only instances built with
+// an N/K-padding GemmSpec are selected and verified; instances without the matching padding
+// spec report IsSupportedArgument() == false and are skipped. N is kept a multiple of 32 and K
+// a multiple of 64 so the host-side weight preshuffle stays exact -- the partial trailing block
+// tile is exactly the region the right-pad B/C descriptors zero-fill on the device.
+
+TYPED_TEST(TestGemmMultiplyMultiplyWP_FP8_MK_NK, NPadding)
+{
+    std::vector<int> Ms{128, 256};
+    constexpr int N = 320; // not a multiple of NPerBlock (128/256/512)
+    constexpr int K = 2048;
+
+    for(int M : Ms)
+        this->Run(M, N, K);
+}
+
+TYPED_TEST(TestGemmMultiplyMultiplyWP_FP8_MK_NK, KPadding)
+{
+    std::vector<int> Ms{128, 256};
+    constexpr int N = 512;
+    constexpr int K = 2112; // multiple of 64 but not of KPerBlock (128/256/512)
+
+    for(int M : Ms)
+        this->Run(M, N, K);
+}
+
+TYPED_TEST(TestGemmMultiplyMultiplyWP_FP8_MK_NK, NKPadding)
+{
+    std::vector<int> Ms{128, 256};
+    constexpr int N = 320; // N padding
+    constexpr int K = 2112; // K padding
+
+    for(int M : Ms)
+        this->Run(M, N, K);
+}
